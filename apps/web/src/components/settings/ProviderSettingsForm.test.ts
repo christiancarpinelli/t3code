@@ -37,6 +37,18 @@ describe("ProviderSettingsForm helpers", () => {
     });
   });
 
+  it("exposes GitHub Copilot CLI configuration in the provider wizard", () => {
+    const copilot = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("githubCopilot")];
+    expect(copilot).toMatchObject({
+      label: "GitHub Copilot",
+      badgeLabel: "Preview",
+    });
+    expect(deriveProviderSettingsFields(copilot!).map((field) => field.key)).toEqual([
+      "binaryPath",
+      "launchArgs",
+    ]);
+  });
+
   it("preserves unknown config keys while omitting empty configurable fields", () => {
     const opencode = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("opencode")];
     expect(opencode).toBeDefined();
