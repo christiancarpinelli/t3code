@@ -1,5 +1,6 @@
 import {
   ApprovalRequestId,
+  type GitHubCopilotSettings,
   type GrokSettings,
   EventId,
   type ProviderApprovalDecision,
@@ -54,6 +55,13 @@ import {
 import { parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
 import {
+  applyGitHubCopilotAcpModelSelection,
+  currentGitHubCopilotModelIdFromSessionSetup,
+  extractGitHubCopilotElicitationQuestions,
+  makeGitHubCopilotElicitationResponse,
+  makeGitHubCopilotAcpRuntime,
+} from "../acp/GitHubCopilotAcpSupport.ts";
+import {
   applyGrokAcpModelSelection,
   currentGrokModelIdFromSessionSetup,
   makeGrokAcpRuntime,
@@ -71,7 +79,6 @@ import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogg
 
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
 
-const PROVIDER = ProviderDriverKind.make("grok");
 const GROK_RESUME_VERSION = 1 as const;
 
 function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
@@ -84,6 +91,7 @@ export interface GrokAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly instanceId?: ProviderInstanceId;
+  readonly adapterKind?: "grok" | "githubCopilot";
 }
 
 interface PendingApproval {
@@ -224,9 +232,16 @@ export function grokPromptSettlementBelongsToContext(input: {
   );
 }
 
-export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapterLiveOptions) {
+export function makeGrokAdapter(
+  grokSettings: GrokSettings | GitHubCopilotSettings,
+  options?: GrokAdapterLiveOptions,
+) {
   return Effect.gen(function* () {
-    const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("grok");
+    const isGitHubCopilot = options?.adapterKind === "githubCopilot";
+    const PROVIDER = ProviderDriverKind.make(isGitHubCopilot ? "githubCopilot" : "grok");
+    const providerDisplayName = isGitHubCopilot ? "GitHub Copilot" : "Grok";
+    const boundInstanceId =
+      options?.instanceId ?? ProviderInstanceId.make(isGitHubCopilot ? "githubCopilot" : "grok");
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -252,7 +267,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           new ProviderAdapterRequestError({
             provider: PROVIDER,
             method: "crypto/randomUUIDv4",
-            detail: "Failed to generate Grok runtime identifier.",
+            detail: `Failed to generate ${providerDisplayName} runtime identifier.`,
             cause,
           }),
       ),
@@ -264,7 +279,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         Effect.mapError(
           (cause) =>
             new EffectAcpErrors.AcpTransportError({
-              detail: "Failed to process Grok ACP callback.",
+              detail: `Failed to process ${providerDisplayName} ACP callback.`,
               cause,
             }),
         ),
@@ -453,7 +468,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         );
       }).pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("Failed to write native Grok notification log.", {
+          Effect.logWarning(`Failed to write native ${providerDisplayName} notification log.`, {
             cause,
             threadId,
             method,
@@ -570,8 +585,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           });
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-          const acp = yield* makeGrokAcpRuntime({
-            grokSettings,
+          const runtimeInput = {
             ...(options?.environment ? { environment: options.environment } : {}),
             childProcessSpawner,
             cwd,
@@ -595,7 +609,18 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 }
               : {}),
             ...acpNativeLoggers,
-          }).pipe(
+          };
+          const acp = yield* (
+            isGitHubCopilot
+              ? makeGitHubCopilotAcpRuntime({
+                  ...runtimeInput,
+                  copilotSettings: grokSettings as GitHubCopilotSettings,
+                })
+              : makeGrokAcpRuntime({
+                  ...runtimeInput,
+                  grokSettings: grokSettings as GrokSettings,
+                })
+          ).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
             Effect.provideService(Scope.Scope, sessionScope),
             Effect.mapError(
@@ -609,60 +634,116 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             ),
           );
           const started = yield* Effect.gen(function* () {
-            yield* Effect.forEach(
-              ["x.ai/ask_user_question", "_x.ai/ask_user_question"] as const,
-              (method) =>
-                acp.handleExtRequest(method, XAiAskUserQuestionRequest, (params) =>
-                  mapAcpCallbackFailure(
-                    Effect.gen(function* () {
-                      yield* logNative(input.threadId, method, params);
-                      const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
-                      const runtimeRequestId = RuntimeRequestId.make(requestId);
-                      const resolution = yield* Deferred.make<PendingUserInputResolution>();
-                      const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
-                      pendingUserInputs.set(requestId, { resolution });
-                      yield* offerRuntimeEvent({
-                        type: "user-input.requested",
-                        ...(yield* makeEventStamp()),
-                        provider: PROVIDER,
-                        threadId: input.threadId,
-                        turnId,
-                        requestId: runtimeRequestId,
-                        payload: { questions: extractXAiAskUserQuestions(params) },
-                        raw: {
-                          source: "acp.grok.extension",
-                          method,
-                          payload: params,
-                        },
-                      });
-                      const resolved = yield* Deferred.await(resolution);
-                      pendingUserInputs.delete(requestId);
-                      const resolvedAnswers = resolved._tag === "answered" ? resolved.answers : {};
-                      yield* offerRuntimeEvent({
-                        type: "user-input.resolved",
-                        ...(yield* makeEventStamp()),
-                        provider: PROVIDER,
-                        threadId: input.threadId,
-                        turnId,
-                        requestId: runtimeRequestId,
-                        payload: { answers: resolvedAnswers },
-                        raw: {
-                          source: "acp.grok.extension",
-                          method,
-                          payload: params,
-                        },
-                      });
-                      switch (resolved._tag) {
-                        case "answered":
-                          return makeXAiAskUserQuestionResponse(params, resolved.answers);
-                        case "cancelled":
-                          return makeXAiAskUserQuestionCancelledResponse();
-                      }
-                    }),
-                  ),
+            if (isGitHubCopilot) {
+              yield* acp.handleElicitation((params) =>
+                mapAcpCallbackFailure(
+                  Effect.gen(function* () {
+                    yield* logNative(input.threadId, "session/elicitation", params);
+                    if (params.mode !== "form") {
+                      return { action: { action: "cancel" as const } };
+                    }
+                    const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
+                    const runtimeRequestId = RuntimeRequestId.make(requestId);
+                    const resolution = yield* Deferred.make<PendingUserInputResolution>();
+                    const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                    pendingUserInputs.set(requestId, { resolution });
+                    yield* offerRuntimeEvent({
+                      type: "user-input.requested",
+                      ...(yield* makeEventStamp()),
+                      provider: PROVIDER,
+                      threadId: input.threadId,
+                      turnId,
+                      requestId: runtimeRequestId,
+                      payload: {
+                        questions: extractGitHubCopilotElicitationQuestions(params),
+                      },
+                      raw: {
+                        source: "acp.jsonrpc",
+                        method: "session/elicitation",
+                        payload: params,
+                      },
+                    });
+                    const resolved = yield* Deferred.await(resolution);
+                    pendingUserInputs.delete(requestId);
+                    const answers = resolved._tag === "answered" ? resolved.answers : {};
+                    yield* offerRuntimeEvent({
+                      type: "user-input.resolved",
+                      ...(yield* makeEventStamp()),
+                      provider: PROVIDER,
+                      threadId: input.threadId,
+                      turnId,
+                      requestId: runtimeRequestId,
+                      payload: { answers },
+                      raw: {
+                        source: "acp.jsonrpc",
+                        method: "session/elicitation",
+                        payload: params,
+                      },
+                    });
+                    return resolved._tag === "answered"
+                      ? makeGitHubCopilotElicitationResponse(params, resolved.answers)
+                      : { action: { action: "cancel" as const } };
+                  }),
                 ),
-              { discard: true },
-            );
+              );
+            }
+            if (!isGitHubCopilot) {
+              yield* Effect.forEach(
+                ["x.ai/ask_user_question", "_x.ai/ask_user_question"] as const,
+                (method) =>
+                  acp.handleExtRequest(method, XAiAskUserQuestionRequest, (params) =>
+                    mapAcpCallbackFailure(
+                      Effect.gen(function* () {
+                        yield* logNative(input.threadId, method, params);
+                        const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
+                        const runtimeRequestId = RuntimeRequestId.make(requestId);
+                        const resolution = yield* Deferred.make<PendingUserInputResolution>();
+                        const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                        pendingUserInputs.set(requestId, { resolution });
+                        yield* offerRuntimeEvent({
+                          type: "user-input.requested",
+                          ...(yield* makeEventStamp()),
+                          provider: PROVIDER,
+                          threadId: input.threadId,
+                          turnId,
+                          requestId: runtimeRequestId,
+                          payload: { questions: extractXAiAskUserQuestions(params) },
+                          raw: {
+                            source: "acp.grok.extension",
+                            method,
+                            payload: params,
+                          },
+                        });
+                        const resolved = yield* Deferred.await(resolution);
+                        pendingUserInputs.delete(requestId);
+                        const resolvedAnswers =
+                          resolved._tag === "answered" ? resolved.answers : {};
+                        yield* offerRuntimeEvent({
+                          type: "user-input.resolved",
+                          ...(yield* makeEventStamp()),
+                          provider: PROVIDER,
+                          threadId: input.threadId,
+                          turnId,
+                          requestId: runtimeRequestId,
+                          payload: { answers: resolvedAnswers },
+                          raw: {
+                            source: "acp.grok.extension",
+                            method,
+                            payload: params,
+                          },
+                        });
+                        switch (resolved._tag) {
+                          case "answered":
+                            return makeXAiAskUserQuestionResponse(params, resolved.answers);
+                          case "cancelled":
+                            return makeXAiAskUserQuestionCancelledResponse();
+                        }
+                      }),
+                    ),
+                  ),
+                { discard: true },
+              );
+            }
             yield* acp.handleRequestPermission((params) =>
               mapAcpCallbackFailure(
                 Effect.gen(function* () {
@@ -736,15 +817,27 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           );
 
           const requestedStartModelId = grokModelSelection?.model
-            ? resolveGrokAcpBaseModelId(grokModelSelection.model)
+            ? isGitHubCopilot
+              ? grokModelSelection.model.trim()
+              : resolveGrokAcpBaseModelId(grokModelSelection.model)
             : undefined;
-          const boundModelId = yield* applyGrokAcpModelSelection({
-            runtime: acp,
-            currentModelId: currentGrokModelIdFromSessionSetup(started.sessionSetupResult),
-            requestedModelId: requestedStartModelId,
-            mapError: (cause) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
-          });
+          const boundModelId = yield* isGitHubCopilot
+            ? applyGitHubCopilotAcpModelSelection({
+                runtime: acp,
+                currentModelId: currentGitHubCopilotModelIdFromSessionSetup(
+                  started.sessionSetupResult,
+                ),
+                requestedModelId: requestedStartModelId,
+                mapError: (cause) =>
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
+              })
+            : applyGrokAcpModelSelection({
+                runtime: acp,
+                currentModelId: currentGrokModelIdFromSessionSetup(started.sessionSetupResult),
+                requestedModelId: requestedStartModelId,
+                mapError: (cause) =>
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
+              });
 
           const now = yield* nowIso;
           const session: ProviderSession = {
@@ -753,7 +846,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             status: "ready",
             runtimeMode: input.runtimeMode,
             cwd,
-            ...(boundModelId ? { model: resolveGrokAcpBaseModelId(boundModelId) } : {}),
+            ...(boundModelId
+              ? { model: isGitHubCopilot ? boundModelId : resolveGrokAcpBaseModelId(boundModelId) }
+              : {}),
             threadId: input.threadId,
             resumeCursor: {
               schemaVersion: GROK_RESUME_VERSION,
@@ -864,6 +959,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                         threadId: ctx.threadId,
                         turnId: notificationTurnId,
                         ...(event.itemId ? { itemId: event.itemId } : {}),
+                        streamKind: event.streamKind,
                         text: event.text,
                         rawPayload: event.rawPayload,
                       }),
@@ -874,7 +970,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             ),
           ).pipe(
             Effect.catch((cause) =>
-              Effect.logError("Failed to process Grok runtime notification.", { cause }),
+              Effect.logError(`Failed to process ${providerDisplayName} runtime notification.`, {
+                cause,
+              }),
             ),
             Effect.forkChild,
           );
@@ -895,7 +993,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             ...(yield* makeEventStamp()),
             provider: PROVIDER,
             threadId: input.threadId,
-            payload: { state: "ready", reason: "Grok ACP session ready" },
+            payload: { state: "ready", reason: `${providerDisplayName} ACP session ready` },
           });
           yield* offerRuntimeEvent({
             type: "thread.started",
@@ -940,15 +1038,25 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   ? input.modelSelection
                   : undefined;
               const requestedTurnModelId = turnModelSelection?.model
-                ? resolveGrokAcpBaseModelId(turnModelSelection.model)
+                ? isGitHubCopilot
+                  ? turnModelSelection.model.trim()
+                  : resolveGrokAcpBaseModelId(turnModelSelection.model)
                 : undefined;
-              const currentModelId = yield* applyGrokAcpModelSelection({
-                runtime: ctx.acp,
-                currentModelId: ctx.currentModelId,
-                requestedModelId: requestedTurnModelId,
-                mapError: (cause) =>
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
-              });
+              const currentModelId = yield* isGitHubCopilot
+                ? applyGitHubCopilotAcpModelSelection({
+                    runtime: ctx.acp,
+                    currentModelId: ctx.currentModelId,
+                    requestedModelId: requestedTurnModelId,
+                    mapError: (cause) =>
+                      mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
+                  })
+                : applyGrokAcpModelSelection({
+                    runtime: ctx.acp,
+                    currentModelId: ctx.currentModelId,
+                    requestedModelId: requestedTurnModelId,
+                    mapError: (cause) =>
+                      mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
+                  });
 
               const text = input.input?.trim();
               const imagePromptParts = yield* Effect.forEach(
@@ -999,7 +1107,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
               ctx.currentModelId = currentModelId;
               const displayModel = currentModelId
-                ? resolveGrokAcpBaseModelId(currentModelId)
+                ? isGitHubCopilot
+                  ? currentModelId
+                  : resolveGrokAcpBaseModelId(currentModelId)
                 : undefined;
               for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
                 yield* Effect.yieldNow;
@@ -1013,7 +1123,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 return yield* new ProviderAdapterRequestError({
                   provider: PROVIDER,
                   method: "session/prompt",
-                  detail: "Grok prompt was interrupted during preparation.",
+                  detail: `${providerDisplayName} prompt was interrupted during preparation.`,
                 });
               }
               if (steeringTurnId === undefined) {
@@ -1053,7 +1163,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                     return;
                   }
                   yield* settlePromptInFlight(input.threadId, turnId, liveCtx.acpSessionId, {
-                    errorMessage: "Grok prompt preparation failed.",
+                    errorMessage: `${providerDisplayName} prompt preparation failed.`,
                     emitTurnCompletion: false,
                   });
                 }),
@@ -1102,7 +1212,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   prepared.turnId,
                   prepared.acpSessionId,
                   {
-                    errorMessage: "Grok session changed before the turn completed.",
+                    errorMessage: `${providerDisplayName} session changed before the turn completed.`,
                     settleAllPrompts: true,
                   },
                 );
@@ -1110,7 +1220,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 return yield* new ProviderAdapterRequestError({
                   provider: PROVIDER,
                   method: "session/prompt",
-                  detail: "Grok session changed before the turn completed.",
+                  detail: `${providerDisplayName} session changed before the turn completed.`,
                 });
               }
               // Keep prompt settlement atomic with respect to Stop and steering.
@@ -1225,7 +1335,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                         prepared.turnId,
                         prepared.acpSessionId,
                         {
-                          errorMessage: "Grok session changed before the turn completed.",
+                          errorMessage: `${providerDisplayName} session changed before the turn completed.`,
                           settleAllPrompts: true,
                         },
                       );
@@ -1264,7 +1374,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
               yield* withThreadLock(
                 input.threadId,
                 settlePromptInFlight(input.threadId, prepared.turnId, prepared.acpSessionId, {
-                  errorMessage: errorMessage ?? "Grok prompt request failed.",
+                  errorMessage: errorMessage ?? `${providerDisplayName} prompt request failed.`,
                 }),
               );
             }).pipe(Effect.catch(() => Effect.void)),
@@ -1410,7 +1520,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
           method: "thread/rollback",
-          detail: "Grok ACP sessions do not support provider-side rollback yet.",
+          detail: `${providerDisplayName} ACP sessions do not support provider-side rollback yet.`,
         });
       });
 

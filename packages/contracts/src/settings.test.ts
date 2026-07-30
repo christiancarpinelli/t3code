@@ -167,6 +167,39 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
   });
 });
 
+describe("ServerSettings GitHub Copilot provider", () => {
+  it("keeps the legacy default instance disabled until explicitly configured", () => {
+    expect(DEFAULT_SERVER_SETTINGS.providers.githubCopilot).toMatchObject({
+      enabled: false,
+      binaryPath: "copilot",
+      launchArgs: "",
+      customModels: [],
+    });
+  });
+
+  it("decodes GitHub Copilot provider patches", () => {
+    expect(
+      decodeServerSettingsPatch({
+        providers: {
+          githubCopilot: {
+            enabled: true,
+            binaryPath: "/opt/copilot",
+            launchArgs: "--experimental",
+          },
+        },
+      }),
+    ).toEqual({
+      providers: {
+        githubCopilot: {
+          enabled: true,
+          binaryPath: "/opt/copilot",
+          launchArgs: "--experimental",
+        },
+      },
+    });
+  });
+});
+
 describe("ServerSettings worktree defaults", () => {
   it("defaults start-from-origin on for legacy configs", () => {
     expect(decodeServerSettings({}).newWorktreesStartFromOrigin).toBe(true);

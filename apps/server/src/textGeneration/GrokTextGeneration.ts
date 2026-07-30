@@ -6,7 +6,11 @@ import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import type * as EffectAcpErrors from "effect-acp/errors";
 
-import { type GrokSettings, type ModelSelection } from "@t3tools/contracts";
+import {
+  type GitHubCopilotSettings,
+  type GrokSettings,
+  type ModelSelection,
+} from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
 
@@ -29,15 +33,23 @@ import {
   makeGrokAcpRuntime,
   resolveGrokAcpBaseModelId,
 } from "../provider/acp/GrokAcpSupport.ts";
+import {
+  applyGitHubCopilotAcpModelSelection,
+  currentGitHubCopilotModelIdFromSessionSetup,
+  makeGitHubCopilotAcpRuntime,
+} from "../provider/acp/GitHubCopilotAcpSupport.ts";
 
 const GROK_TIMEOUT_MS = 180_000;
 
 const isTextGenerationError = Schema.is(TextGenerationError);
 
 export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(function* (
-  grokSettings: GrokSettings,
+  grokSettings: GrokSettings | GitHubCopilotSettings,
   environment: NodeJS.ProcessEnv = process.env,
+  options?: { readonly adapterKind?: "grok" | "githubCopilot" },
 ) {
+  const isGitHubCopilot = options?.adapterKind === "githubCopilot";
+  const providerDisplayName = isGitHubCopilot ? "GitHub Copilot" : "Grok";
   const crypto = yield* Crypto.Crypto;
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 
@@ -59,15 +71,27 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
     modelSelection: ModelSelection;
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
-      const resolvedModel = resolveGrokAcpBaseModelId(modelSelection.model);
+      const resolvedModel = isGitHubCopilot
+        ? modelSelection.model.trim()
+        : resolveGrokAcpBaseModelId(modelSelection.model);
       const outputRef = yield* Ref.make("");
-      const runtime = yield* makeGrokAcpRuntime({
-        grokSettings,
+      const runtimeInput = {
         environment,
         childProcessSpawner: commandSpawner,
         cwd,
         clientInfo: { name: "t3-code-git-text", version: "0.0.0" },
-      }).pipe(Effect.provideService(Crypto.Crypto, crypto));
+      };
+      const runtime = yield* (
+        isGitHubCopilot
+          ? makeGitHubCopilotAcpRuntime({
+              ...runtimeInput,
+              copilotSettings: grokSettings as GitHubCopilotSettings,
+            })
+          : makeGrokAcpRuntime({
+              ...runtimeInput,
+              grokSettings: grokSettings as GrokSettings,
+            })
+      ).pipe(Effect.provideService(Crypto.Crypto, crypto));
 
       yield* runtime.handleSessionUpdate((notification) => {
         const update = notification.update;
@@ -83,17 +107,31 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
 
       const promptResult = yield* Effect.gen(function* () {
         const started = yield* runtime.start();
-        yield* applyGrokAcpModelSelection({
-          runtime,
-          currentModelId: currentGrokModelIdFromSessionSetup(started.sessionSetupResult),
-          requestedModelId: resolvedModel,
-          mapError: (cause) =>
-            new TextGenerationError({
-              operation,
-              detail: "Failed to set Grok ACP base model for text generation.",
-              cause,
-            }),
-        });
+        yield* isGitHubCopilot
+          ? applyGitHubCopilotAcpModelSelection({
+              runtime,
+              currentModelId: currentGitHubCopilotModelIdFromSessionSetup(
+                started.sessionSetupResult,
+              ),
+              requestedModelId: resolvedModel,
+              mapError: (cause) =>
+                new TextGenerationError({
+                  operation,
+                  detail: `Failed to set ${providerDisplayName} ACP base model for text generation.`,
+                  cause,
+                }),
+            })
+          : applyGrokAcpModelSelection({
+              runtime,
+              currentModelId: currentGrokModelIdFromSessionSetup(started.sessionSetupResult),
+              requestedModelId: resolvedModel,
+              mapError: (cause) =>
+                new TextGenerationError({
+                  operation,
+                  detail: "Failed to set Grok ACP base model for text generation.",
+                  cause,
+                }),
+            });
 
         return yield* runtime.prompt({
           prompt: [{ type: "text", text: prompt }],
@@ -104,7 +142,10 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
           Option.match({
             onNone: () =>
               Effect.fail(
-                new TextGenerationError({ operation, detail: "Grok ACP request timed out." }),
+                new TextGenerationError({
+                  operation,
+                  detail: `${providerDisplayName} ACP request timed out.`,
+                }),
               ),
             onSome: (value) => Effect.succeed(value),
           }),
@@ -114,7 +155,7 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
             ? cause
             : new TextGenerationError({
                 operation,
-                detail: "Grok ACP request failed.",
+                detail: `${providerDisplayName} ACP request failed.`,
                 cause,
               }),
         ),
@@ -127,7 +168,7 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
           detail:
             promptResult.stopReason === "cancelled"
               ? "Grok ACP request was cancelled."
-              : "Grok Agent returned empty output.",
+              : `${providerDisplayName} returned empty output.`,
         });
       }
 
@@ -138,7 +179,7 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
             Effect.fail(
               new TextGenerationError({
                 operation,
-                detail: "Grok Agent returned invalid structured output.",
+                detail: `${providerDisplayName} returned invalid structured output.`,
                 cause,
               }),
             ),
@@ -150,7 +191,7 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
           ? cause
           : new TextGenerationError({
               operation,
-              detail: "Grok ACP text generation failed.",
+              detail: `${providerDisplayName} ACP text generation failed.`,
               cause,
             }),
       ),
