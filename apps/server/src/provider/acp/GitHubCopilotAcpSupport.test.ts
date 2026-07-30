@@ -6,8 +6,6 @@ import {
   applyGitHubCopilotAcpModelSelection,
   buildGitHubCopilotAcpSpawnInput,
   currentGitHubCopilotModelIdFromSessionSetup,
-  extractGitHubCopilotElicitationQuestions,
-  makeGitHubCopilotElicitationResponse,
 } from "./GitHubCopilotAcpSupport.ts";
 
 describe("buildGitHubCopilotAcpSpawnInput", () => {
@@ -34,72 +32,6 @@ describe("buildGitHubCopilotAcpSpawnInput", () => {
       args: ["--acp", "--stdio", "--experimental", "--reasoning-effort=high"],
       cwd: "/tmp/project",
       env: { COPILOT_GITHUB_TOKEN: "secret" },
-    });
-  });
-});
-
-describe("GitHub Copilot ACP elicitation", () => {
-  const request = {
-    mode: "form" as const,
-    sessionId: "session",
-    message: "Choose release settings",
-    requestedSchema: {
-      type: "object" as const,
-      title: "Release",
-      properties: {
-        channel: {
-          type: "string" as const,
-          title: "Channel",
-          description: "Where should this ship?",
-          enum: ["preview", "stable"],
-        },
-        notify: {
-          type: "boolean" as const,
-          title: "Notify",
-        },
-      },
-    },
-  };
-
-  it("projects ACP form fields into T3 Code questions", () => {
-    expect(extractGitHubCopilotElicitationQuestions(request)).toEqual([
-      {
-        id: "channel",
-        header: "Channel",
-        question: "Where should this ship?",
-        options: [
-          { label: "preview", description: "preview" },
-          { label: "stable", description: "stable" },
-        ],
-        multiSelect: false,
-      },
-      {
-        id: "notify",
-        header: "Notify",
-        question: "Choose release settings",
-        options: [
-          { label: "Yes", description: "Yes" },
-          { label: "No", description: "No" },
-        ],
-        multiSelect: false,
-      },
-    ]);
-  });
-
-  it("converts T3 Code answers back to typed ACP form content", () => {
-    expect(
-      makeGitHubCopilotElicitationResponse(request, {
-        channel: "stable",
-        notify: "Yes",
-      }),
-    ).toEqual({
-      action: {
-        action: "accept",
-        content: {
-          channel: "stable",
-          notify: true,
-        },
-      },
     });
   });
 });

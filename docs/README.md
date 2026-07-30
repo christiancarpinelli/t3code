@@ -15,7 +15,6 @@
 - [Integrations](./integrations/source-control-providers.md)
 - [Mobile](./mobile/app.md)
 - [Operations](./operations/ci.md)
-- Providers
-  - [Codex](./providers/codex.md)
-  - [GitHub Copilot CLI](./providers/github-copilot.md)
+- [Providers](./providers/codex.md)
+- [GitHub Copilot CLI](./providers/github-copilot.md)
 - [Reference](./reference/encyclopedia.md)

@@ -10,15 +10,14 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import { makeGrokTextGeneration } from "../../textGeneration/GrokTextGeneration.ts";
+import { makeGitHubCopilotTextGeneration } from "../../textGeneration/GitHubCopilotTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import {
   buildInitialGitHubCopilotProviderSnapshot,
   checkGitHubCopilotProviderStatus,
   enrichGitHubCopilotSnapshot,
 } from "../Layers/GitHubCopilotProvider.ts";
-import { makeGrokAdapter } from "../Layers/GrokAdapter.ts";
-import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
+import { makeGitHubCopilotAdapter } from "../Layers/GitHubCopilotAdapter.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -58,7 +57,6 @@ export type GitHubCopilotDriverEnv =
   | FileSystem.FileSystem
   | HttpClient.HttpClient
   | Path.Path
-  | ProviderEventLoggers
   | ServerConfig
   | ServerSettingsService;
 
@@ -92,7 +90,6 @@ export const GitHubCopilotDriver: ProviderDriver<GitHubCopilotSettings, GitHubCo
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
-      const eventLoggers = yield* ProviderEventLoggers;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
@@ -110,15 +107,11 @@ export const GitHubCopilotDriver: ProviderDriver<GitHubCopilotSettings, GitHubCo
         env: processEnv,
       });
 
-      const adapter = yield* makeGrokAdapter(effectiveConfig, {
-        adapterKind: "githubCopilot",
+      const adapter = yield* makeGitHubCopilotAdapter(effectiveConfig, {
         environment: processEnv,
-        ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
         instanceId,
       });
-      const textGeneration = yield* makeGrokTextGeneration(effectiveConfig, processEnv, {
-        adapterKind: "githubCopilot",
-      });
+      const textGeneration = yield* makeGitHubCopilotTextGeneration(effectiveConfig, processEnv);
       const checkProvider = checkGitHubCopilotProviderStatus(effectiveConfig, processEnv).pipe(
         Effect.map(stampIdentity),
         Effect.provideService(Crypto.Crypto, crypto),

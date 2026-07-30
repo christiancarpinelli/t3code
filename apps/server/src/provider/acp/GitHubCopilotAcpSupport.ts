@@ -1,8 +1,4 @@
-import type {
-  GitHubCopilotSettings,
-  ProviderUserInputAnswers,
-  UserInputQuestion,
-} from "@t3tools/contracts";
+import type { GitHubCopilotSettings } from "@t3tools/contracts";
 import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -49,13 +45,6 @@ export const makeGitHubCopilotAcpRuntime = (
     const acpContext = yield* Layer.build(
       AcpSessionRuntime.layer({
         ...input,
-        clientCapabilities: {
-          ...input.clientCapabilities,
-          elicitation: {
-            ...input.clientCapabilities?.elicitation,
-            form: {},
-          },
-        },
         spawn: buildGitHubCopilotAcpSpawnInput(input.copilotSettings, input.cwd, input.environment),
       }).pipe(
         Layer.provide(
@@ -67,94 +56,6 @@ export const makeGitHubCopilotAcpRuntime = (
       Effect.provide(acpContext),
     );
   });
-
-function elicitationOptions(
-  property: EffectAcpSchema.ElicitationPropertySchema,
-): ReadonlyArray<{ readonly label: string; readonly description: string }> {
-  if (property.type === "boolean") {
-    return [
-      { label: "Yes", description: "Yes" },
-      { label: "No", description: "No" },
-    ];
-  }
-  if (property.type === "string") {
-    const values =
-      property.oneOf?.map((option) => ({
-        label: option.const,
-        description: option.title ?? option.const,
-      })) ??
-      property.enum?.map((value) => ({ label: value, description: value })) ??
-      [];
-    return values.length > 0 ? values : [{ label: "Enter a value", description: "Other" }];
-  }
-  if (property.type === "array") {
-    const values =
-      "enum" in property.items
-        ? property.items.enum.map((value) => ({ label: value, description: value }))
-        : property.items.anyOf.map((option) => ({
-            label: option.const,
-            description: option.title ?? option.const,
-          }));
-    return values.length > 0 ? values : [{ label: "Enter a value", description: "Other" }];
-  }
-  return [{ label: "Enter a value", description: "Other" }];
-}
-
-export function extractGitHubCopilotElicitationQuestions(
-  request: Extract<EffectAcpSchema.ElicitationRequest, { readonly mode: "form" }>,
-): ReadonlyArray<UserInputQuestion> {
-  return Object.entries(request.requestedSchema.properties ?? {}).map(([id, property]) => ({
-    id,
-    header: property.title?.trim() || request.requestedSchema.title?.trim() || "Question",
-    question: property.description?.trim() || request.message.trim() || id,
-    options: elicitationOptions(property),
-    multiSelect: property.type === "array",
-  }));
-}
-
-function firstAnswer(value: unknown): unknown {
-  return Array.isArray(value) ? value[0] : value;
-}
-
-export function makeGitHubCopilotElicitationResponse(
-  request: Extract<EffectAcpSchema.ElicitationRequest, { readonly mode: "form" }>,
-  answers: ProviderUserInputAnswers,
-): EffectAcpSchema.ElicitationResponse {
-  const entries: Array<[string, EffectAcpSchema.ElicitationContentValue]> = [];
-  for (const [id, property] of Object.entries(request.requestedSchema.properties ?? {})) {
-    const answer = answers[id];
-    if (answer === undefined) continue;
-    if (property.type === "array") {
-      const values = Array.isArray(answer) ? answer : [answer];
-      entries.push([id, values.map(String)]);
-      continue;
-    }
-    const value = firstAnswer(answer);
-    if (property.type === "boolean") {
-      if (typeof value === "boolean") {
-        entries.push([id, value]);
-        continue;
-      }
-      const normalized = String(value).trim().toLowerCase();
-      if (normalized === "yes" || normalized === "true") {
-        entries.push([id, true]);
-      } else if (normalized === "no" || normalized === "false") {
-        entries.push([id, false]);
-      }
-      continue;
-    }
-    if (property.type === "number" || property.type === "integer") {
-      const number = Number(value);
-      if (Number.isFinite(number)) {
-        entries.push([id, number]);
-      }
-      continue;
-    }
-    entries.push([id, String(value)]);
-  }
-  const content = Object.fromEntries(entries);
-  return { action: { action: "accept", content } };
-}
 
 export function currentGitHubCopilotModelIdFromSessionSetup(
   sessionSetupResult:

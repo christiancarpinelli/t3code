@@ -3,7 +3,6 @@ import {
   type ModelCapabilities,
   type ServerProvider,
   type ServerProviderModel,
-  type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import { createModelCapabilities } from "@t3tools/shared/model";
@@ -71,24 +70,6 @@ function modelsFromAcpState(
   });
 }
 
-function slashCommandsFromAcp(
-  commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
-): ReadonlyArray<ServerProviderSlashCommand> {
-  return commands.flatMap((command) => {
-    const name = command.name.trim().replace(/^\/+/, "");
-    if (!name) return [];
-    const description = command.description?.trim() || undefined;
-    const hint = command.input?.hint?.trim() || undefined;
-    return [
-      {
-        name,
-        ...(description ? { description } : {}),
-        ...(hint ? { input: { hint } } : {}),
-      },
-    ];
-  });
-}
-
 export const buildInitialGitHubCopilotProviderSnapshot = Effect.fn(
   "buildInitialGitHubCopilotProviderSnapshot",
 )(function* (settings: GitHubCopilotSettings) {
@@ -130,10 +111,7 @@ const discoverModels = Effect.fn("discoverGitHubCopilotModels")(function* (
   });
   const started = yield* acp.start();
   yield* Effect.yieldNow;
-  return {
-    models: modelsFromAcpState(started.sessionSetupResult.models),
-    slashCommands: slashCommandsFromAcp(yield* acp.getAvailableCommands),
-  };
+  return modelsFromAcpState(started.sessionSetupResult.models);
 }, Effect.scoped);
 
 export const checkGitHubCopilotProviderStatus = Effect.fn("checkGitHubCopilotProviderStatus")(
@@ -254,13 +232,12 @@ export const checkGitHubCopilotProviderStatus = Effect.fn("checkGitHubCopilotPro
       });
     }
 
-    const discovered = discovery.value.value;
+    const discoveredModels = discovery.value.value;
     return buildServerProvider({
       presentation: PRESENTATION,
       enabled: true,
       checkedAt,
-      models: modelsFromSettings(settings.customModels, discovered.models),
-      slashCommands: discovered.slashCommands,
+      models: modelsFromSettings(settings.customModels, discoveredModels),
       probe: {
         installed: true,
         version,
